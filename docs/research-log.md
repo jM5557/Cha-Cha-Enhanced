@@ -872,3 +872,15 @@ Dated, append-only notes of discoveries. Newest at the bottom. Each entry: what 
   it. On Wayland "Fullscreen" now uses desktop fullscreen (null mode); Windows and X11 keep the exclusive mode. Each
   swapchain logs window points, swapchain pixels and the display scale (Windows 100 %: windowed 1920x1080 / 1920x1080,
   borderless and fullscreen 2560x1440 / 2560x1440).
+- **Cheats and Cemu-Enhanced texture packs (2026-11-07, fork).** jM5557's MH3U cheat file (US v32,
+  [MH3U-Cemu-Cheats](https://github.com/jM5557/MH3U-Cemu-Cheats)) has 37 cheats. Only 2 are data writes: *Many Zenny*
+  writes a fixed heap address (0x2E62CBD8, Cemu's layout), and *Frame cap 44 FPS* follows the static pointer at
+  0x1043CEA44 to sMain+0x50. The other 35 patch instructions in 1-6 functions each (all inside `config/functions.csv`
+  bodies, none outside a function). Most branch into code caves at 0x01BFxxxx and back, and the caves call game
+  functions with `bl`. 1,197 words go into code or caves: 1,186 instructions, all ops the recompiler already emits
+  (no paired singles, mftb or FPSCR ops), plus 11 constants. Patches land in three overridden functions: cameraPitchInput? 0x02286890,
+  cameraTurnInput? 0x02286F18 and sResult::rewardStep? 0x02180870, all wrappers that call `__orig`. So patched
+  functions run through an interpreter that mirrors the emitter, behind a flag checked on function entry
+  (docs/cheats.md). Cemu-Enhanced's texture content hash (64-bit word mix over the tiled level 0, surface size,
+  pixel count and GX2 format, splitmix finalizer) was reimplemented and checked bit for bit against its code on
+  2,000 random buffers (docs/texture-packs.md).

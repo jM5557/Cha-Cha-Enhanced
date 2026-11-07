@@ -8,6 +8,9 @@
 #include "presenter.h"
 #include "guest_memory.h"
 #include "launcher_image.h"
+#include "mods_ini.h"
+#include "cheats.h"
+#include "texture_pack.h"
 #include "quests.h"
 #include "save_reads.h"
 #include "translate.h"
@@ -20,6 +23,7 @@
 #include <imgui_internal.h>
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -556,7 +560,25 @@ struct Launcher::Impl {
     enum class Mode { Title, Hidden, InGame } mode = Mode::Title;
     enum class Panel { None, Settings, Mods } panel = Panel::None;
     enum class Tab { General, Video, Input } tab = Tab::General;
-    enum class ModsTab { Quests } mods_tab = ModsTab::Quests;  // item sets, HP scaling, hold to carve: always on (no tab)
+    enum class ModsTab { Quests, Cheats, Textures } mods_tab = ModsTab::Quests;  // item sets, HP scaling, hold to carve: always on (no tab)
+    // MODS -> CHEATS: the cheat file (<data>/cheats/<title id>.txt; the bundled one when there is none), applied to the
+    // running game at once; the master switch is mods.ini cheats=on|off
+    std::vector<cheats::Cheat> cheat_list;
+    // per cheat: its row label and description (rebuilt every frame the tab shows; the description pane keeps pointers)
+    std::vector<std::string> cheat_label, cheat_desc;
+    std::string cheats_head_desc;
+    bool cheats_stale = true;
+    stdfs::path cheat_file() const { return cheats::file_for(paths.data / "cheats"); }
+    void refresh_cheats();
+    void draw_tab_cheats(PanelLayout& p);
+    // MODS -> TEXTURES: the packs in <data>/texture_replacements, on unless mods.ini says texpack.<name>=off
+    std::vector<std::string> tex_packs;
+    std::vector<std::string> tex_desc;
+    std::set<std::string> tex_off;
+    bool tex_stale = true;
+    stdfs::path texture_dir() const { return paths.data / "texture_replacements"; }
+    void refresh_textures();
+    void draw_tab_textures(PanelLayout& p);
     // MODS -> QUESTS: the library (<data>/quests), pack modes (<data>/mods.ini) and what the save has installed; re-read
     // (and packs applied) at start and whenever the panel opens or changes something
     quests::Library quest_library;
@@ -765,6 +787,8 @@ Launcher::Launcher(const AppPaths& paths, gfx::Presenter& presenter, std::vector
         const std::string o = open;
         d.panel = o.rfind("mods", 0) == 0 ? Impl::Panel::Mods : Impl::Panel::Settings;
         d.tab = o.find("video") != std::string::npos ? Impl::Tab::Video : o.find("input") != std::string::npos ? Impl::Tab::Input : Impl::Tab::General;
+        d.mods_tab = o.find("cheats") != std::string::npos ? Impl::ModsTab::Cheats
+                     : o.find("textures") != std::string::npos ? Impl::ModsTab::Textures : Impl::ModsTab::Quests;
     }
     std::free(open);
     if (!g_sound.open()) std::fprintf(stderr, "launcher: no sound (%s)\n", SDL_GetError());
@@ -862,7 +886,7 @@ void Launcher::Impl::toggle_panel(Panel which) {
     if (d.keyboard) return;  // finish the text first
     if (d.mode == Impl::Mode::InGame && d.panel != which) {  // F1 over MODS / F2 over the settings: switch
         d.panel = which;
-        d.quests_stale = true;
+        d.quests_stale = d.cheats_stale = d.tex_stale = true;
         d.refocus = true;
         g_sound.play(Sfx::Tab);
     } else if (d.mode == Impl::Mode::InGame) {
@@ -873,7 +897,7 @@ void Launcher::Impl::toggle_panel(Panel which) {
         ImGui::GetIO().ClearInputKeys();
         d.mode = Impl::Mode::InGame;
         d.panel = which;
-        d.quests_stale = true;
+        d.quests_stale = d.cheats_stale = d.tex_stale = true;
         d.refocus = true;
         d.last = {};  // draw at once
     } else if (d.panel == which) {  // the title overlay: the same keys open and close its panels
@@ -882,7 +906,7 @@ void Launcher::Impl::toggle_panel(Panel which) {
         if (d.panel == Panel::None) g_sound.play(Sfx::Select);
         else g_sound.play(Sfx::Tab);
         d.panel = which;
-        d.quests_stale = true;
+        d.quests_stale = d.cheats_stale = d.tex_stale = true;
         d.refocus = true;
     }
 }
@@ -1073,7 +1097,7 @@ void Launcher::Impl::draw_title(const LaunchState& st, ImVec2 size, bool& play, 
     }
     if (menu_item("MODS", fonts.menu, menu_w)) {
         panel = Panel::Mods;
-        quests_stale = true;
+        quests_stale = cheats_stale = tex_stale = true;
         refocus = true;
     }
     if (menu_item("QUIT", fonts.menu, menu_w)) quit = true;
@@ -1169,10 +1193,12 @@ void Launcher::Impl::draw_panel(ImVec2 size) {
         const char* name;
     };
     static const TabDef kSettingsTabs[] = {{Tab::General, "General"}, {Tab::Video, "Video"}, {Tab::Input, "Input"}};
-    static const char* const kModsTabs[] = {"Quests"};
+    static const char* const kModsTabs[] = {"Quests", "Cheats", "Textures"};
     const bool mods = panel == Panel::Mods;
     if (mods && quests_stale) refresh_quests();  // also applies the pack modes
-    const int ntabs = mods ? 1 : 3;
+    if (mods && cheats_stale) refresh_cheats();
+    if (mods && tex_stale) refresh_textures();
+    const int ntabs = 3;
     const float header_h = 72 * s, seg_h = 38 * s, seg_pad = 24 * s;
     float seg_total = 0;
     for (int i = 0; i < ntabs; ++i)
@@ -1213,8 +1239,9 @@ void Launcher::Impl::draw_panel(ImVec2 size) {
         int step = 0;
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1) || ImGui::IsKeyPressed(ImGuiKey_Q, false)) step = -1;
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1) || ImGui::IsKeyPressed(ImGuiKey_E, false)) step = 1;
-        if (step && !mods) {
-            tab = static_cast<Tab>((static_cast<int>(tab) + step + 3) % 3);
+        if (step) {
+            if (mods) mods_tab = static_cast<ModsTab>((static_cast<int>(mods_tab) + step + 3) % 3);
+            else tab = static_cast<Tab>((static_cast<int>(tab) + step + 3) % 3);
             g_sound.play(Sfx::Tab);
             refocus = true;
         }
@@ -1268,7 +1295,9 @@ void Launcher::Impl::draw_panel(ImVec2 size) {
         refocus = false;
     }
     if (mods) {
-        draw_tab_quests(p);
+        if (mods_tab == ModsTab::Cheats) draw_tab_cheats(p);
+        else if (mods_tab == ModsTab::Textures) draw_tab_textures(p);
+        else draw_tab_quests(p);
     } else if (tab == Tab::General) {
         draw_tab_general(p);
     } else if (tab == Tab::Video) {
@@ -1506,11 +1535,13 @@ void Launcher::Impl::draw_tab_video(PanelLayout& p) {
 
     group_begin(p, "Textures");
     switch_row(p, "Texture packs", draft.texture_packs,
-               "Replacement textures from the texture_replacements folder (DDS files named after the game texture).");
+               "Replacement textures from the texture_replacements folder: DDS files named after the game texture, in "
+               "packs you switch on and off in MODS > Textures. Cemu-Enhanced packs work as they are.");
     // applies at once, without APPLY (a one-off action, not a saved setting)
     if (switch_row(p, "Dump textures", dumping,
-                   "Saves every texture the game shows as a DDS file in the texture_dump folder, named so that a copy in "
-                   "texture_replacements replaces it - the way to make a texture pack. Starts at once; off again next start.")) {
+                   "Saves every texture the game shows as a DDS file in the texture_dump folder, named after its content "
+                   "hash as Cemu-Enhanced names them, so an edited copy in a pack replaces it - the way to make a texture "
+                   "pack. Starts at once; off again next start.")) {
         gfx::set_texture_dump(dumping);
         dump_base = dumps_shown = gfx::texture_dumps();
         toast(dumping ? "Dumping textures to " + dump_folder() : "Texture dump off - " + std::to_string(dumps_shown) + " files so far in " + dump_folder());
@@ -1533,19 +1564,14 @@ quests::PackMode Launcher::Impl::pack_mode(const quests::Pack& p) const {
 
 void Launcher::Impl::load_pack_modes() {
     pack_modes.clear();
-    std::ifstream f(paths.data / "mods.ini");
-    for (std::string line; std::getline(f, line);) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const size_t eq = line.rfind('=');
-        if (line.rfind("pack.", 0) != 0 || eq == std::string::npos) continue;
-        pack_modes[line.substr(5, eq - 5)] = quests::mode_from_name(line.substr(eq + 1), quests::PackMode::Choose);
-    }
+    for (const auto& [k, v] : read_mods_ini(paths.data / "mods.ini"))
+        if (k.rfind("pack.", 0) == 0) pack_modes[k.substr(5)] = quests::mode_from_name(v, quests::PackMode::Choose);
 }
 
 void Launcher::Impl::save_pack_modes() const {
-    std::ofstream f(paths.data / "mods.ini", std::ios::trunc);
-    f << "# Cha-Cha mods. pack.<folder in quests> = all | choose | off\n";
-    for (const auto& [k, m] : pack_modes) f << "pack." << k << '=' << quests::mode_name(m) << '\n';
+    ModsIni lines;
+    for (const auto& [k, m] : pack_modes) lines.emplace_back("pack." + k, quests::mode_name(m));
+    write_mods_ini(paths.data / "mods.ini", "pack.", lines);
 }
 
 // The game reads a quest file in 64 KB pieces into one scratch buffer and copies them on, so the copy it keeps is
@@ -1755,6 +1781,193 @@ void Launcher::Impl::draw_tab_quests(PanelLayout& p) {
         toast("Couldn't " + std::string(act_remove ? "remove " : "install ") + title + ": " + err);
     }
     quests_stale = true;  // re-read next frame (the rows above point into the lists)
+}
+
+// MODS -> CHEATS. The list is the cheat file, in Cemu-Enhanced's format, so files made for it work as they are; a
+// switch saves the file and the running game picks the change up on its next frame. Cheats that patch the game's code
+// make the patched functions run through the interpreter (runtime/cheats/cheats.h); turning one off puts the original
+// code back.
+void Launcher::Impl::refresh_cheats() {
+    const stdfs::path file = cheat_file();
+    if (cheats::install_bundled(file)) toast("Cheats: the bundled MH3U cheats are in " + file.parent_path().string());
+    cheat_list = cheats::load(file);
+    cheats::engine().set_cheats(cheat_list);
+    cheats::engine().set_enabled(mods_value(read_mods_ini(paths.data / "mods.ini"), "cheats", "on") != "off");
+    cheats_stale = false;
+}
+
+void Launcher::Impl::draw_tab_cheats(PanelLayout& p) {
+    cheats::Engine& eng = cheats::engine();
+    const auto u = cheat_file().u8string();
+    const std::string file(u.begin(), u.end());
+    cheats_head_desc = "Cheats run every frame while you play. Turning one off restores the game's original code, so in "
+                       "Cha-Cha the matching DISABLE cheat isn't needed.\n\nThis switch turns them all off at once without "
+                       "changing which ones are ticked.";
+    group_begin(p, "Cheats");
+    bool on = eng.enabled();
+    if (switch_row(p, "Cheats", on, cheats_head_desc.c_str())) {
+        eng.set_enabled(on);
+        write_mods_ini(paths.data / "mods.ini", "cheats", {{"cheats", on ? "on" : "off"}});
+        g_sound.play(Sfx::Apply);
+        toast(on ? "Cheats on" : "Cheats off - the game's original code is back");
+    }
+    static std::string file_desc;
+    file_desc = "Gateway-style codes, one file per game, in the same format as Cemu-Enhanced and Citra: [name], an optional "
+                "{note}, *cemu_enabled, then code lines. Edit it with any text editor, then Reload.\n\n" + file;
+    if (button_row(p, "Cheat file", file_desc.c_str(), true, "Open")) {
+        std::error_code ec;
+        stdfs::create_directories(cheat_file().parent_path(), ec);
+        std::string url = "file:///" + std::string(reinterpret_cast<const char*>(cheat_file().parent_path().u8string().c_str()));
+        std::replace(url.begin(), url.end(), '\\', '/');
+        SDL_OpenURL(url.c_str());
+    }
+    if (button_row(p, "Reload", "Read the cheat file again (after editing it while Cha-Cha runs).", true, "Reload")) {
+        cheats_stale = true;
+        toast("Cheat file read again");
+    }
+    int ticked = 0;
+    for (const auto& c : cheat_list) ticked += c.enabled ? 1 : 0;
+    char status[96];
+    std::snprintf(status, sizeof status, "%d ticked, %zu running, %u functions patched", ticked, eng.running(), eng.patched_functions());
+    info_row(p, "Status", status,
+             "Ticked cheats that parse run from the next frame. Functions whose code a cheat changed run interpreted (slower, "
+             "but only those); the count only rises once a game is running.");
+    group_end(p);
+
+    const auto problems = eng.problems();
+    cheat_desc.assign(cheat_list.size(), {});
+    cheat_label.assign(cheat_list.size(), {});
+    int changed = -1;
+    std::string group;
+    bool open = false;
+    for (size_t i = 0; i < cheat_list.size(); ++i) {
+        cheats::Cheat& c = cheat_list[i];
+        // "QOL - Name - ..." is grouped under QOL
+        std::string head = "Cheats";
+        std::string& label = cheat_label[i];
+        label = c.name;
+        if (const size_t dash = c.name.find(" - "); dash != std::string::npos && dash > 0 && dash <= 16) {
+            head = c.name.substr(0, dash);
+            label = c.name.substr(dash + 3);
+        }
+        if (!open || head != group) {
+            if (open) group_end(p);
+            group_begin(p, head.c_str());
+            group = head;
+            open = true;
+        }
+        std::string& d = cheat_desc[i];
+        d = c.notes.empty() ? std::string() : c.notes + "\n\n";
+        if (auto it = problems.find(c.name); it != problems.end()) d += "Problem: " + it->second + "\n\n";
+        d += std::to_string(c.code.size()) + " code line" + (c.code.size() == 1 ? "" : "s");
+        ImGui::PushID(static_cast<int>(i));
+        bool en = c.enabled;
+        if (switch_row(p, label.c_str(), en, d.c_str())) {
+            c.enabled = en;
+            changed = static_cast<int>(i);
+        }
+        ImGui::PopID();
+    }
+    if (open) group_end(p);
+    if (cheat_list.empty()) {
+        group_begin(p, nullptr);
+        info_row(p, "No cheats in the file", "", file_desc.c_str());
+        group_end(p);
+    }
+    if (changed < 0) return;
+    std::string err;
+    if (!cheats::save(cheat_file(), cheat_list, err)) {
+        g_sound.play(Sfx::Back);
+        toast("Couldn't save the cheat file: " + err);
+        return;
+    }
+    eng.set_cheats(cheat_list);
+    g_sound.play(Sfx::Apply);
+    const auto problems_now = eng.problems();
+    const cheats::Cheat& c = cheat_list[static_cast<size_t>(changed)];
+    if (auto it = problems_now.find(c.name); c.enabled && it != problems_now.end()) toast(c.name + " can't run: " + it->second);
+    else toast(c.name + (c.enabled ? " on" : " off"));
+}
+
+// MODS -> TEXTURES. Each folder in texture_replacements is a pack (Cemu-Enhanced's <title id>/<pack> folders too);
+// switching one changes what the renderer replaces from the next frame. Texture packs as a whole are a SETTINGS ->
+// Video switch.
+void Launcher::Impl::refresh_textures() {
+    std::error_code ec;
+    stdfs::create_directories(texture_dir(), ec);
+    tex_packs = gfx::texpack::list_packs(texture_dir());
+    tex_off.clear();
+    for (const auto& [k, v] : read_mods_ini(paths.data / "mods.ini"))
+        if (k.rfind("texpack.", 0) == 0 && v == "off") tex_off.insert(k.substr(8));
+    tex_desc.assign(tex_packs.size(), {});
+    for (size_t i = 0; i < tex_packs.size(); ++i) {
+        size_t files = 0;
+        bool ini = false;
+        const stdfs::path dir = texture_dir() / stdfs::path(std::u8string(tex_packs[i].begin(), tex_packs[i].end()));
+        for (auto it = stdfs::recursive_directory_iterator(dir, stdfs::directory_options::skip_permission_denied, ec);
+             !ec && it != stdfs::recursive_directory_iterator(); it.increment(ec)) {
+            std::string ext = it->path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](char ch) { return static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); });
+            files += ext == ".dds" ? 1 : 0;
+        }
+        ini = stdfs::exists(dir / "textures.ini", ec);
+        tex_desc[i] = std::to_string(files) + " DDS file" + (files == 1 ? "" : "s") + (ini ? ", with a textures.ini" : "") +
+                      ".\n\nWhere two packs that are on replace the same texture, the one listed first wins.";
+    }
+    tex_stale = false;
+}
+
+void Launcher::Impl::draw_tab_textures(PanelLayout& p) {
+    const auto u = texture_dir().u8string();
+    const std::string folder(u.begin(), u.end());
+    static std::string folder_desc;
+    folder_desc = "Each folder here is a pack: DDS files named after the texture they replace (as texture dumps and "
+                  "Cemu-Enhanced name them), or any names listed in the pack's textures.ini. Cemu-Enhanced packs work as "
+                  "they are, also in its <title id>/<pack> folders. DDS files straight in this folder are always used.\n\n" +
+                  folder;
+    group_begin(p, "Library");
+    if (button_row(p, "Texture folder", folder_desc.c_str(), true, "Open")) {
+        std::string url = "file:///" + folder;
+        std::replace(url.begin(), url.end(), '\\', '/');
+        SDL_OpenURL(url.c_str());
+    }
+    if (button_row(p, "Refresh", "Read the texture folder again (after adding packs while Cha-Cha runs).", true, "Rescan")) {
+        tex_stale = true;
+        gfx::set_texture_pack_selection(std::vector<std::string>(tex_off.begin(), tex_off.end()));  // the renderer rescans too
+        toast("Texture folder read again");
+    }
+    info_row(p, "Texture packs", settings.texture_packs ? "On" : "Off (SETTINGS > Video)",
+             "Replacing textures as a whole is switched in SETTINGS > Video > Texture packs; the packs below choose which "
+             "ones are used.");
+    group_end(p);
+    if (tex_packs.empty()) {
+        group_begin(p, nullptr);
+        info_row(p, "No packs in the folder yet", "", folder_desc.c_str());
+        group_end(p);
+        return;
+    }
+    group_begin(p, "Packs");
+    bool changed = false;
+    std::string msg;
+    for (size_t i = 0; i < tex_packs.size(); ++i) {
+        bool on = !tex_off.count(tex_packs[i]);
+        ImGui::PushID(static_cast<int>(i));
+        if (switch_row(p, tex_packs[i].c_str(), on, tex_desc[i].c_str())) {
+            if (on) tex_off.erase(tex_packs[i]);
+            else tex_off.insert(tex_packs[i]);
+            changed = true;
+            msg = tex_packs[i] + (on ? " on" : " off");
+        }
+        ImGui::PopID();
+    }
+    group_end(p);
+    if (!changed) return;
+    ModsIni lines;
+    for (const auto& n : tex_off) lines.emplace_back("texpack." + n, "off");
+    write_mods_ini(paths.data / "mods.ini", "texpack.", lines);
+    gfx::set_texture_pack_selection(std::vector<std::string>(tex_off.begin(), tex_off.end()));
+    g_sound.play(Sfx::Apply);
+    toast(msg);
 }
 
 // INPUT: layout and mouse options, then one row per game button / stick direction with what the keyboard + mouse and

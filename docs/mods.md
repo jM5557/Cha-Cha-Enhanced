@@ -1,7 +1,12 @@
 # Mods
 
 **MODS** is on the title menu, and **F2** opens it over the game. F1 switches to the settings, and F2 again or Esc / B
-closes it. It has one tab, QUESTS; the gameplay changes below are always on.
+closes it. It has three tabs, switched with LB / RB or Q / E. QUESTS, CHEATS ([docs/cheats.md](cheats.md)) and
+TEXTURES (the texture packs, [docs/texture-packs.md](texture-packs.md)). The gameplay changes below are always on.
+
+What the panel chooses is kept in `<data folder>/mods.ini`: `pack.<folder>=all|choose|off` for quest packs,
+`cheats=on|off` for the cheats' master switch, and `texpack.<folder>=off` for texture packs switched off. The cheat
+list itself is the cheat file.
 
 ## QUESTS: event and challenge quests
 
